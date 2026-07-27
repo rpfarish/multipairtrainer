@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import confetti from "canvas-confetti";
 import { Menu, X, ChevronLeft, ChevronRight, Shuffle } from "lucide-react";
 import "./PairTrainer.css";
-import { motion, AnimatePresence } from "framer-motion";
 
 const LETTERS = Array.from({ length: 26 }, (_, i) =>
   String.fromCharCode(65 + i),
@@ -93,6 +92,16 @@ function fmtETA(ms) {
   return `${m}m`;
 }
 
+function fireConfetti() {
+  const durationMs = 500;
+  const end = Date.now() + durationMs;
+  (function frame() {
+    confetti({ particleCount: 3, angle: 60, spread: 120, origin: { x: 0 } });
+    confetti({ particleCount: 3, angle: 120, spread: 120, origin: { x: 1 } });
+    if (Date.now() < end) requestAnimationFrame(frame);
+  })();
+}
+
 export default function PairTrainer() {
   const [loading, setLoading] = useState(true);
   const [session, setSession] = useState(null);
@@ -100,10 +109,15 @@ export default function PairTrainer() {
   const [draftLetters, setDraftLetters] = useState(new Set(LETTERS));
   const [autoSeconds, setAutoSeconds] = useState("");
   const [now, setNow] = useState(Date.now());
-  const [flash, setFlash] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const inputFocusedRef = useRef(false);
   const autoTimerRef = useRef(null);
+
+  // ---- scroll-glow refs ----
+  const scrollContainerRef = useRef(null);
+  const itemRefs = useRef(new Map());
+  const isProgrammaticScrollRef = useRef(false);
+  const programmaticScrollTimeoutRef = useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -141,54 +155,46 @@ export default function PairTrainer() {
     return () => clearInterval(t);
   }, []);
 
+  // Shared "move to index" logic used by Next button, keyboard, and manual
+  // scroll-driven navigation, so stats/confetti stay consistent everywhere.
+  const advanceTo = useCallback(
+    (newIndex) => {
+      setSession((prev) => {
+        if (!prev) return prev;
+        if (newIndex < 0 || newIndex > prev.pairs.length - 1) return prev;
+        if (newIndex === prev.index) return prev;
+
+        const duration = Date.now() - prev.lastAdvance;
+        const movedForwardOne = newIndex === prev.index + 1;
+
+        if (newIndex === prev.pairs.length - 1 && newIndex > prev.index) {
+          fireConfetti();
+        }
+
+        const updated = {
+          ...prev,
+          index: newIndex,
+          pairTimes: movedForwardOne
+            ? [...prev.pairTimes, duration]
+            : prev.pairTimes,
+          lastAdvance: Date.now(),
+        };
+
+        persist(updated);
+        return updated;
+      });
+    },
+    [persist],
+  );
+
   const next = useCallback(() => {
     setSession((prev) => {
-      if (!prev) return prev;
-      if (prev.index >= prev.pairs.length - 1) return prev;
-
-      const duration = Date.now() - prev.lastAdvance;
-      const newIndex = prev.index + 1;
-
-      // Fire confetti when reaching the last pair.
-      if (newIndex === prev.pairs.length - 1) {
-        const durationMs = 500;
-        const end = Date.now() + durationMs;
-
-        (function frame() {
-          confetti({
-            particleCount: 3,
-            angle: 60,
-            spread: 120,
-            origin: { x: 0 },
-          });
-
-          confetti({
-            particleCount: 3,
-            angle: 120,
-            spread: 120,
-            origin: { x: 1 },
-          });
-
-          if (Date.now() < end) {
-            requestAnimationFrame(frame);
-          }
-        })();
-      }
-
-      const updated = {
-        ...prev,
-        index: newIndex,
-        pairTimes: [...prev.pairTimes, duration],
-        lastAdvance: Date.now(),
-      };
-
-      persist(updated);
-      return updated;
+      if (!prev || prev.index >= prev.pairs.length - 1) return prev;
+      advanceTo(prev.index + 1);
+      return prev;
     });
+  }, [advanceTo]);
 
-    setFlash(true);
-    setTimeout(() => setFlash(false), 150);
-  }, [persist]);
   const prev = useCallback(() => {
     setSession((p) => {
       if (!p || p.index <= 0) return p;
@@ -285,13 +291,66 @@ export default function PairTrainer() {
     return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen, next, prev, reshuffle, confirmMenu]);
 
+  // Keep the scroll strip in sync whenever the current index changes
+  // (buttons, keyboard, auto-advance, reshuffle). Scrolling here is marked
+  // "programmatic" so the observer below doesn't fight it.
+  useEffect(() => {
+    if (!session) return;
+    const el = itemRefs.current.get(session.index);
+    if (!el || !scrollContainerRef.current) return;
+
+    isProgrammaticScrollRef.current = true;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    if (programmaticScrollTimeoutRef.current)
+      clearTimeout(programmaticScrollTimeoutRef.current);
+    programmaticScrollTimeoutRef.current = setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+    }, 500);
+
+    return () => {
+      if (programmaticScrollTimeoutRef.current)
+        clearTimeout(programmaticScrollTimeoutRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.index, session?.pairs]);
+
+  // Let the user free-scroll the strip to jump around; whichever card sits
+  // in the centered "reticle" band becomes the active one.
+  useEffect(() => {
+    if (!scrollContainerRef.current || !session) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (isProgrammaticScrollRef.current) return;
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            const idx = Number(entry.target.getAttribute("data-index"));
+            if (!Number.isNaN(idx)) advanceTo(idx);
+          }
+        });
+      },
+      {
+        root: scrollContainerRef.current,
+        rootMargin: "-49% 0px -49% 0px",
+        threshold: 0,
+      },
+    );
+
+    itemRefs.current.forEach((el) => {
+      if (el) observer.observe(el);
+    });
+
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.pairs, advanceTo]);
+
   if (loading || !session) {
     return <div className="pt-loading">loading...</div>;
   }
 
   const total = session.pairs.length;
-  const currentPair = session.pairs[session.index];
-  const isComplete = session.index >= total;
+  const isComplete = session.index >= total - 1;
   const elapsed = now - session.startTime;
   const pairTimes = session.pairTimes;
   const avg = pairTimes.length
@@ -329,15 +388,36 @@ export default function PairTrainer() {
           {session.index + 1} / {total}
         </span>
 
-        <div className="pt-card">
-          <div className="pt-corner pt-corner-tl" />
-          <div className="pt-corner pt-corner-tr" />
-          <div className="pt-corner pt-corner-bl" />
-          <div className="pt-corner pt-corner-br" />
+        <div className="pt-scroll-wrap">
+          <div className="pt-glow-bg" />
+          <div className="pt-reticle" />
+          <div className="pt-fade pt-fade-top" />
+          <div className="pt-fade pt-fade-bottom" />
 
-          <span className={`pt-pair-text${flash ? " pt-flash" : ""}`}>
-            {currentPair}
-          </span>
+          <div ref={scrollContainerRef} className="pt-scroll-container">
+            <div className="pt-scroll-spacer" />
+            {session.pairs.map((pair, index) => {
+              const isCurrent = index === session.index;
+              return (
+                <div
+                  key={`${pair}-${index}`}
+                  ref={(el) => {
+                    if (el) itemRefs.current.set(index, el);
+                    else itemRefs.current.delete(index);
+                  }}
+                  data-index={index}
+                  className="pt-scroll-item"
+                >
+                  <span
+                    className={`pt-pair-text${isCurrent ? " pt-pair-current" : ""}`}
+                  >
+                    {pair}
+                  </span>
+                </div>
+              );
+            })}
+            <div className="pt-scroll-spacer" />
+          </div>
 
           {isComplete && (
             <span className="pt-complete-label">
