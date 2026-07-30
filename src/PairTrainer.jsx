@@ -1,12 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import confetti from "canvas-confetti";
-import { Menu, X, ChevronLeft, ChevronRight, Shuffle } from "lucide-react";
+import {
+  Menu,
+  X,
+  ChevronLeft,
+  ChevronRight,
+  Shuffle,
+  Upload,
+} from "lucide-react";
 import "./PairTrainer.css";
 
 const LETTERS = Array.from({ length: 26 }, (_, i) =>
   String.fromCharCode(65 + i),
 );
 const STORAGE_KEY = "ptr:session";
+const CONTENT_STORAGE_KEY = "ptr:content";
 
 /**
  * Thin wrapper around window.localStorage that mirrors the shape of the
@@ -102,6 +110,100 @@ function fireConfetti() {
   })();
 }
 
+/**
+ * Minimal RFC4180-ish CSV parser: handles quoted fields (including embedded
+ * commas, newlines, and escaped "" quotes) as well as plain unquoted
+ * fields, and normalizes \r\n / \r / \n line endings.
+ */
+function parseCSV(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += c;
+      }
+      continue;
+    }
+
+    if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (c === "\r") {
+      // swallow; \r\n is handled by the following \n, bare \r treated as
+      // a line break too
+      if (text[i + 1] !== "\n") {
+        row.push(field);
+        rows.push(row);
+        row = [];
+        field = "";
+      }
+    } else {
+      field += c;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((r) =>
+    r.some((cell) => cell !== undefined && cell.trim() !== ""),
+  );
+}
+
+/**
+ * Builds a { "AB": "content", ... } map from parsed CSV rows.
+ *
+ * Expected shape (matches the sample sheet): the header row's columns
+ * (after the first cell) are the FIRST letter of the pair, and each
+ * subsequent row's first cell is the SECOND letter of the pair. So the
+ * cell at column "A" / row "B" holds the example words for the pair "AB".
+ */
+function buildPairContent(rows) {
+  const map = {};
+  if (!rows.length) return map;
+
+  const header = rows[0];
+  const colLetters = header
+    .slice(1)
+    .map((h) => (h || "").trim().toUpperCase().slice(0, 1));
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row || !row.length) continue;
+    const rowLetter = (row[0] || "").trim().toUpperCase().slice(0, 1);
+    if (!rowLetter) continue;
+
+    for (let c = 1; c < row.length; c++) {
+      const colLetter = colLetters[c - 1];
+      if (!colLetter) continue;
+      const content = (row[c] || "").trim();
+      if (!content) continue;
+      map[colLetter + rowLetter] = content;
+    }
+  }
+  return map;
+}
+
 export default function PairTrainer() {
   const [loading, setLoading] = useState(true);
   const [session, setSession] = useState(null);
@@ -110,8 +212,12 @@ export default function PairTrainer() {
   const [autoSeconds, setAutoSeconds] = useState("");
   const [now, setNow] = useState(Date.now());
   const [saveError, setSaveError] = useState(false);
+  const [pairContent, setPairContent] = useState({});
+  const [showAnswer, setShowAnswer] = useState(false);
+  const [importError, setImportError] = useState("");
   const inputFocusedRef = useRef(false);
   const autoTimerRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   // ---- scroll-glow refs ----
   const scrollContainerRef = useRef(null);
@@ -122,15 +228,27 @@ export default function PairTrainer() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await storage.get(STORAGE_KEY);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
+        const [sessionRes, contentRes] = await Promise.all([
+          storage.get(STORAGE_KEY),
+          storage.get(CONTENT_STORAGE_KEY),
+        ]);
+
+        if (sessionRes && sessionRes.value) {
+          const parsed = JSON.parse(sessionRes.value);
           setSession(parsed);
           setDraftLetters(new Set(parsed.letters));
         } else {
           const fresh = freshSession(LETTERS);
           setSession(fresh);
           await storage.set(STORAGE_KEY, JSON.stringify(fresh));
+        }
+
+        if (contentRes && contentRes.value) {
+          try {
+            setPairContent(JSON.parse(contentRes.value));
+          } catch (e) {
+            // ignore corrupt content cache
+          }
         }
       } catch (e) {
         setSession(freshSession(LETTERS));
@@ -147,6 +265,14 @@ export default function PairTrainer() {
       else setSaveError(false);
     } catch (e) {
       setSaveError(true);
+    }
+  }, []);
+
+  const persistContent = useCallback(async (map) => {
+    try {
+      await storage.set(CONTENT_STORAGE_KEY, JSON.stringify(map));
+    } catch (e) {
+      // non-critical; imported content just won't survive a reload
     }
   }, []);
 
@@ -183,6 +309,7 @@ export default function PairTrainer() {
         persist(updated);
         return updated;
       });
+      setShowAnswer(false);
     },
     [persist],
   );
@@ -202,6 +329,7 @@ export default function PairTrainer() {
       persist(updated);
       return updated;
     });
+    setShowAnswer(false);
   }, [persist]);
 
   const reshuffle = useCallback(() => {
@@ -210,6 +338,7 @@ export default function PairTrainer() {
       persist(fresh);
       return fresh;
     });
+    setShowAnswer(false);
     setMenuOpen(false);
   }, [persist]);
 
@@ -219,8 +348,41 @@ export default function PairTrainer() {
     const fresh = freshSession(letters);
     setSession(fresh);
     persist(fresh);
+    setShowAnswer(false);
     setMenuOpen(false);
   }, [draftLetters, persist]);
+
+  const triggerImport = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleImportFile = useCallback(
+    async (e) => {
+      const file = e.target.files && e.target.files[0];
+      // allow re-selecting the same file later
+      e.target.value = "";
+      if (!file) return;
+
+      setImportError("");
+      try {
+        const text = await file.text();
+        const rows = parseCSV(text);
+        const map = buildPairContent(rows);
+
+        if (!Object.keys(map).length) {
+          setImportError("No pairs found in that CSV");
+          return;
+        }
+
+        setPairContent(map);
+        persistContent(map);
+        setShowAnswer(false);
+      } catch (err) {
+        setImportError("Couldn't read that CSV");
+      }
+    },
+    [persistContent],
+  );
 
   useEffect(() => {
     if (menuOpen && session) setDraftLetters(new Set(session.letters));
@@ -272,6 +434,10 @@ export default function PairTrainer() {
         case "ArrowLeft":
           e.preventDefault();
           prev();
+          break;
+        case "Enter":
+          e.preventDefault();
+          setShowAnswer((s) => !s);
           break;
         case "r":
         case "R":
@@ -360,6 +526,9 @@ export default function PairTrainer() {
   const min = pairTimes.length ? Math.min(...pairTimes) : 0;
   const remaining = total - (session.index + 1);
   const etaMs = avg > 0 ? remaining * avg : 0;
+  const currentPair = session.pairs[session.index];
+  const currentContent = pairContent[currentPair];
+  const contentCount = Object.keys(pairContent).length;
 
   function toggleDraft(letter) {
     setDraftLetters((prev) => {
@@ -375,17 +544,36 @@ export default function PairTrainer() {
       {/* top bar */}
       <div className="pt-topbar">
         <span className="pt-topbar-label">Pair Memo · AA–ZZ</span>
-        <button onClick={() => setMenuOpen(true)} className="pt-menu-btn">
-          <Menu size={16} />
-          Letters
-          <span className="pt-kbd-badge">M</span>
-        </button>
+        <div className="pt-topbar-actions">
+          <button onClick={triggerImport} className="pt-menu-btn">
+            <Upload size={16} />
+            Import
+            <span className="pt-kbd-badge">CSV</span>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            onChange={handleImportFile}
+            className="pt-hidden-input"
+          />
+          <button onClick={() => setMenuOpen(true)} className="pt-menu-btn">
+            <Menu size={16} />
+            Letters
+            <span className="pt-kbd-badge">M</span>
+          </button>
+        </div>
       </div>
+
+      {importError && <div className="pt-import-error">{importError}</div>}
 
       {/* main */}
       <div className="pt-main">
         <span className="pt-counter">
           {session.index + 1} / {total}
+          {contentCount > 0 && (
+            <span className="pt-content-badge">{contentCount} imported</span>
+          )}
         </span>
 
         <div className="pt-scroll-wrap">
@@ -426,6 +614,15 @@ export default function PairTrainer() {
           )}
         </div>
 
+        {showAnswer && (
+          <div className="pt-answer-box">
+            <span className="pt-answer-pair">{currentPair}</span>
+            <span className="pt-answer-text">
+              {currentContent || "No entries for this pair"}
+            </span>
+          </div>
+        )}
+
         {/* stats */}
         <div className="pt-stats">
           <Stat label="Elapsed" value={fmtDuration(elapsed)} />
@@ -463,6 +660,11 @@ export default function PairTrainer() {
             <span className="pt-kbd-badge">R</span>
           </button>
 
+          <button onClick={() => setShowAnswer((s) => !s)} className="pt-btn">
+            {showAnswer ? "Hide" : "Reveal"}
+            <span className="pt-kbd-badge">Enter</span>
+          </button>
+
           <div className="pt-auto-wrap">
             <label className="pt-auto-label">Auto (s)</label>
             <input
@@ -489,6 +691,9 @@ export default function PairTrainer() {
         </span>
         <span>
           <Kbd>←</Kbd> prev
+        </span>
+        <span>
+          <Kbd>Enter</Kbd> reveal
         </span>
         <span>
           <Kbd>R</Kbd> reshuffle
